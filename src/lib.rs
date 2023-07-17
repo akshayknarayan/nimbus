@@ -9,6 +9,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
 use tracing::{debug, info};
+use std::error::Error;
+use csv::Writer;
+use std::fs::File;
+use std::io;
+
 
 #[derive(Clone, Copy, Debug)]
 pub enum FlowMode {
@@ -240,6 +245,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
             k: 0f64,
             ack_cnt: 0f64,
             cnt: 0f64,
+            writer: Writer::from_path("/users/yashkoth/nimbus-measurement/basic_experiment/logs/stats.csv").unwrap(),
         };
 
         s.cwnd = (0..s.xtcp_flows)
@@ -252,6 +258,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
         let wt = s.wait_time;
         s.sc = s.install(wt);
         s.send_pattern(s.rate, wt);
+        s.writer.write_record(&["id","duration","elasticity"]).unwrap();
 
         s
     }
@@ -334,6 +341,7 @@ pub struct NimbusFlow<T: Ipc> {
     cur_direction: f64,
     prev_direction: f64,
     prev_update_rtt: Instant,
+    writer:Writer<File>,
 }
 
 impl<T: Ipc> Flow for NimbusFlow<T> {
@@ -749,9 +757,9 @@ impl<T: Ipc> NimbusFlow<T> {
                 * self.ewma_alpha
                 * (fft_zt[exp_peak_zt_master].norm() / fft_zout[exp_peak_zout_master].norm());
 
-        if self.start_time.unwrap().elapsed() < Duration::from_secs(15) {
-            return;
-        }
+        // if self.start_time.unwrap().elapsed() < Duration::from_secs(15) {
+        //     return;
+        // }
 
         debug!(
             ID = self.sock_id,
@@ -765,6 +773,10 @@ impl<T: Ipc> NimbusFlow<T> {
             Expected_Peak = expected_peak,
             "elasticity_inf"
         );
+        let duration = self.start_time.unwrap().elapsed().as_micros();
+        self.writer.write_record([self.sock_id.to_string(),duration.to_string(),elasticity2.to_string()]).unwrap();
+        self.writer.flush().unwrap();
+
     }
 
     fn find_peak(
