@@ -7,7 +7,7 @@ use rustfft::FftPlanner;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use structopt::StructOpt;
 use tracing::{debug, info};
 
@@ -200,7 +200,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
         s.sc = s.install(wt);
         s.send_pattern(s.rate, wt);
         if let Some(w) = &mut s.writer {
-            w.write_record(["id", "duration", "elasticity"]).unwrap();
+            w.write_record(["id", "duration", "timestamp", "elasticity"]).unwrap();
         }
 
         s
@@ -668,11 +668,13 @@ impl<T: Ipc> NimbusFlow<T> {
             Expected_Peak = expected_peak,
             "elasticity_inf"
         );
+        let time_millis = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_millis();
         let duration = self.start_time.unwrap().elapsed().as_micros();
         if let Some(w) = &mut self.writer {
             w.write_record([
                 self.sock_id.to_string(),
                 duration.to_string(),
+                time_millis.to_string(),
                 elasticity2.to_string(),
             ])
             .unwrap();
