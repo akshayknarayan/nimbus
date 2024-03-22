@@ -4,12 +4,13 @@ use portus::ipc::Ipc;
 use portus::lang::Scope;
 use portus::{CongAlg, Datapath, DatapathInfo, DatapathTrait, Flow, Report};
 use rustfft::FftPlanner;
+use structopt::StructOpt;
+use tracing::{debug, info};
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use structopt::StructOpt;
-use tracing::{debug, info};
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "nimbus")]
@@ -199,12 +200,20 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
         let wt = s.wait_time;
         s.sc = s.install(wt);
         s.send_pattern(s.rate, wt);
-        if let Some(w) = &mut s.writer {
-            w.write_record(["id", "duration", "elasticity"]).unwrap();
-        }
-
         s
     }
+}
+
+#[derive(serde::Serialize)]
+struct NimbusRecord {
+    id: u32,
+    t_unix_ms: u128,
+    since_start_ms: u64,
+    rin_bps: f64,
+    rout_bps: f64,
+    zt_bps: f64,
+    rtt_us: u64,
+    elasticity: f64,
 }
 
 pub struct NimbusFlow<T: Ipc> {
@@ -668,14 +677,21 @@ impl<T: Ipc> NimbusFlow<T> {
             Expected_Peak = expected_peak,
             "elasticity_inf"
         );
-        let duration = self.start_time.unwrap().elapsed().as_micros();
         if let Some(w) = &mut self.writer {
-            w.write_record([
-                self.sock_id.to_string(),
-                duration.to_string(),
-                elasticity2.to_string(),
-            ])
-            .unwrap();
+            let r = NimbusRecord {
+                id: self.sock_id,
+                t_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("unix time")
+                    .as_millis(),
+                since_start_ms: self.start_time.unwrap().elapsed().as_millis() as u64,
+                rin_bps: self.ewma_rin * 8.0,
+                rout_bps: self.ewma_rout * 8.0,
+                zt_bps: avg_zt * 8.0,
+                rtt_us: self.rtt.as_micros() as u64,
+                elasticity: elasticity2,
+            };
+            w.serialize(r).unwrap();
             w.flush().unwrap();
         }
     }
