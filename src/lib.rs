@@ -142,6 +142,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
 
             rate: 100000f64,
 
+            fft_planner: FftPlanner::new(),
             zout_history: vec![],
             zt_history: vec![],
             rtt_history: vec![],
@@ -203,6 +204,7 @@ pub struct NimbusFlow<T: Ipc> {
     uest: f64,
     rate: f64,
 
+    fft_planner: rustfft::FftPlanner<f64>,
     frequency: f64,
     pulse_size: f64,
     zout_history: Vec<f64>,
@@ -305,7 +307,7 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
         self.rate = self.elasticity_est_pulse().max(0.05 * self.uest);
 
         self.send_pattern(self.rate, self.wait_time);
-        self.should_switch_flow_mode();
+        self.measure_elasticity();
         self.last_update = Instant::now();
 
         debug!(
@@ -398,7 +400,7 @@ impl<T: Ipc> NimbusFlow<T> {
         }
     }
 
-    fn should_switch_flow_mode(&mut self) {
+    fn measure_elasticity(&mut self) {
         let mut duration_of_fft = 5.0;
         let t = self.measurement_interval.as_secs_f64();
 
@@ -455,13 +457,11 @@ impl<T: Ipc> NimbusFlow<T> {
         let avg_zt = self.mean_complex(&clean_zt[(0.75 * (clean_zt.len() as f32)) as usize..]);
 
         let mut fft_zt = self.detrend(clean_zt);
-        let mut fft_zt_temp_plan = FftPlanner::new();
-        let fft_zt_temp = fft_zt_temp_plan.plan_fft_forward(fft_zt.len());
+        let fft_zt_temp = self.fft_planner.plan_fft_forward(fft_zt.len());
         fft_zt_temp.process(&mut fft_zt[..]);
 
         let mut fft_zout = self.detrend(clean_zout);
-        let mut fft_zout_temp_plan = FftPlanner::new();
-        let fft_zout_temp = fft_zout_temp_plan.plan_fft_forward(fft_zout.len());
+        let fft_zout_temp = self.fft_planner.plan_fft_forward(fft_zout.len());
         fft_zout_temp.process(&mut fft_zout[..]);
 
         let mut freq: Vec<f64> = Vec::new();
