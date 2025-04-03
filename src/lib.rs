@@ -137,7 +137,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
             base_rtt: -0.001f64, // careful
             last_update: now,
             rtt: Duration::from_millis(300),
-            ewma_rtt: 0.1f64,
+            ewma_rtt: None,
             start_time: None,
 
             rate: 100000f64,
@@ -194,7 +194,7 @@ pub struct NimbusFlow<T: Ipc> {
     mss: u32,
 
     rtt: Duration,
-    ewma_rtt: f64,
+    ewma_rtt: Option<f64>,
     last_update: Instant,
     base_rtt: f64,
     wait_time: Duration,
@@ -247,7 +247,10 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
         }
 
         let rtt_seconds = self.rtt.as_secs_f64();
-        self.ewma_rtt = 0.95 * self.ewma_rtt + 0.05 * rtt_seconds;
+        self.ewma_rtt = self
+            .ewma_rtt
+            .map(|ewma_rtt| 0.95 * ewma_rtt + 0.05 * rtt_seconds)
+            .or(Some(rtt_seconds));
         if self.base_rtt <= 0.0 || rtt_seconds < self.base_rtt {
             // careful
             self.base_rtt = rtt_seconds;
