@@ -1,4 +1,5 @@
 use csv::Writer;
+use cubic::Cubic;
 use num_complex::Complex;
 use portus::ipc::Ipc;
 use portus::lang::Scope;
@@ -11,6 +12,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+mod cubic;
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "nimbus")]
@@ -42,9 +45,6 @@ pub struct NimbusConfig {
     #[structopt(long = "uest", default_value = "12000000.0")]
     pub uest: f64,
 
-    #[structopt(long = "xtcp_flows", default_value = "2")]
-    pub xtcp_flows: usize,
-
     #[structopt(long = "log_file")]
     pub log_file: Option<PathBuf>,
 }
@@ -72,7 +72,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
             "nimbus_program",
             String::from(
                 "
-                (def 
+                (def
                     (Report
                         (volatile acked 0)
                         (volatile rtt 0)
@@ -117,7 +117,6 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
             pulse_size = ?self.cfg.pulse_size ,
             frequency = ?self.cfg.frequency ,
             uest = ?self.cfg.uest ,
-            xtcp_flows = ?self.cfg.xtcp_flows,
             "[nimbus] starting",
         );
 
@@ -130,24 +129,18 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
             mss: info.mss,
 
             bw_est_mode: self.cfg.bw_est_mode, // default to true
-            xtcp_flows: self.cfg.xtcp_flows as i32,
             frequency: self.cfg.frequency,
             pulse_size: self.cfg.pulse_size,
             uest: self.cfg.uest,
             use_ewma: self.cfg.use_ewma,
             //set_win_cap:  self.cfg.set_win_cap_arg,
             base_rtt: -0.001f64, // careful
-            last_drop: vec![],
             last_update: now,
             rtt: Duration::from_millis(300),
             ewma_rtt: 0.1f64,
             start_time: None,
-            ssthresh: vec![],
-            cwnd_clamp: 2e6 * 1448.0,
 
             rate: 100000f64,
-            ewma_rate: 10000f64,
-            cwnd: vec![],
 
             zout_history: vec![],
             zt_history: vec![],
@@ -159,42 +152,20 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
 
             rin_history: vec![],
             rout_history: vec![],
-            agg_last_drop: now,
             max_rout: 0.0f64,
             ewma_rin: 0.0f64,
             ewma_rout: 0.0f64,
 
             wait_time: Duration::from_millis(5),
 
-            //cubic_init_cwnd: 10f64,
-            cubic_cwnd: 10f64,
-            cubic_ssthresh: ((0x7fffffff as f64) / 1448.0),
-            cwnd_cnt: 0f64,
-            tcp_friendliness: true,
-            cubic_beta: 0.3f64,
-            fast_convergence: true,
-            c: 0.4f64,
+            cubic: Cubic::new(info.mss),
 
-            wlast_max: 0f64,
-            epoch_start: None,
-            origin_point: 0f64,
-            d_min: -0.0001f64,
-            wtcp: 0f64,
-            k: 0f64,
-            ack_cnt: 0f64,
-            cnt: 0f64,
             writer: self
                 .cfg
                 .log_file
                 .as_ref()
                 .map(|f| Writer::from_path(f).unwrap()),
         };
-
-        s.cwnd = (0..s.xtcp_flows)
-            .map(|_| s.rate / (s.xtcp_flows as f64))
-            .collect();
-        s.last_drop = (0..s.xtcp_flows).map(|_| now).collect();
-        s.ssthresh = (0..s.xtcp_flows).map(|_| s.cwnd_clamp).collect();
 
         //s.cubic_reset(); Careful
         let wt = s.wait_time;
@@ -224,7 +195,6 @@ pub struct NimbusFlow<T: Ipc> {
 
     rtt: Duration,
     ewma_rtt: f64,
-    last_drop: Vec<Instant>,
     last_update: Instant,
     base_rtt: f64,
     wait_time: Duration,
@@ -232,11 +202,6 @@ pub struct NimbusFlow<T: Ipc> {
 
     uest: f64,
     rate: f64,
-    ewma_rate: f64,
-    cwnd: Vec<f64>,
-    xtcp_flows: i32,
-    ssthresh: Vec<f64>,
-    cwnd_clamp: f64,
 
     frequency: f64,
     pulse_size: f64,
@@ -251,30 +216,13 @@ pub struct NimbusFlow<T: Ipc> {
 
     rin_history: Vec<f64>,
     rout_history: Vec<f64>,
-    agg_last_drop: Instant,
     bw_est_mode: bool,
     max_rout: f64,
     ewma_rin: f64,
     ewma_rout: f64,
     use_ewma: bool,
     //set_win_cap: bool,
-
-    //cubic_init_cwnd: f64,
-    cubic_cwnd: f64,
-    cubic_ssthresh: f64,
-    cwnd_cnt: f64,
-    tcp_friendliness: bool,
-    cubic_beta: f64,
-    fast_convergence: bool,
-    c: f64,
-    wlast_max: f64,
-    epoch_start: Option<Instant>,
-    origin_point: f64,
-    d_min: f64,
-    wtcp: f64,
-    k: f64,
-    ack_cnt: f64,
-    cnt: f64,
+    cubic: cubic::Cubic,
 
     writer: Option<Writer<File>>,
 }
@@ -286,12 +234,15 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
         self.rtt = Duration::from_micros(rtt_us as _);
 
         if loss > 0 {
-            self.handle_drop();
+            self.cubic.drop(self.sock_id, self.rtt);
+            let cwnd = self.cubic.curr_cwnd_bytes();
+            self.rate = cwnd / self.rtt.as_secs_f64();
+            self.send_pattern(self.rate, self.wait_time);
             return;
         }
 
         if was_timeout {
-            self.handle_timeout(); // Careful
+            self.cubic.drop(self.sock_id, self.rtt); // Careful
             return;
         }
 
@@ -305,6 +256,11 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
         if self.start_time.is_none() {
             self.start_time = Some(now);
         }
+
+        // Cubic update
+        self.cubic.update_rate(acked as u64, self.rtt);
+        // update self.rate based on cubic
+        self.rate = self.cubic.curr_cwnd_bytes() / rtt_seconds;
 
         let elapsed = (now - self.start_time.unwrap()).as_secs_f64();
         //let mut  float_rin = rin as f64;
@@ -339,10 +295,9 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
             self.last_hist_update += self.measurement_interval;
         }
 
+        // Overlay Nimbus pulse
         // check this
         self.frequency = 5.0f64;
-        self.update_rate_loss(acked as u64);
-
         self.rate = self.rate.max(0.05 * self.uest);
         self.rate = self.elasticity_est_pulse().max(0.05 * self.uest);
 
@@ -352,18 +307,17 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
 
         debug!(
             ID = self.sock_id,
-            base_rtt = self.base_rtt,
-            curr_rate = self.rate * 8.0,
-            curr_cwnd = self.cwnd[0],
-            newly_acked = acked,
-            rin = rin * 8.0,
-            rout = rout * 8.0,
-            ewma_rin = self.ewma_rin * 8.0,
-            ewma_rout = self.ewma_rout * 8.0,
-            max_ewma_rout = self.max_rout * 8.0,
-            zt = zt * 8.0,
-            rtt = rtt_seconds,
-            uest = self.uest * 8.0,
+            base_rtt_sec = self.base_rtt,
+            curr_rate_bps = self.rate * 8.0,
+            newly_acked_bytes = acked,
+            rin_bps = rin * 8.0,
+            rout_bps = rout * 8.0,
+            ewma_rin_bps = self.ewma_rin * 8.0,
+            ewma_rout_bps = self.ewma_rout * 8.0,
+            max_ewma_rout_bps = self.max_rout * 8.0,
+            zt_bps = zt * 8.0,
+            rtt_sec = rtt_seconds,
+            uest_bps = self.uest * 8.0,
             elapsed = elapsed,
             "[nimbus] got ack"
         );
@@ -418,111 +372,6 @@ impl<T: Ipc> NimbusFlow<T> {
         Some((acked, rtt, rin, rout, loss, was_timeout))
     }
 
-    fn handle_drop(&mut self) {
-        self.cubic_drop()
-    }
-
-    fn cubic_drop(&mut self) {
-        let now = Instant::now();
-        if (now - self.last_drop[0]) < self.rtt {
-            return;
-        }
-        self.epoch_start = None; //careful
-        if (self.cubic_cwnd < self.wlast_max) && self.fast_convergence {
-            self.wlast_max = self.cubic_cwnd * ((2.0 - self.cubic_beta) / 2.0);
-        } else {
-            self.wlast_max = self.cubic_cwnd;
-        }
-        self.cubic_cwnd *= 1.0 - self.cubic_beta;
-        self.cubic_ssthresh = self.cubic_cwnd;
-        self.cwnd[0] = self.cubic_cwnd * 1448.0;
-        self.rate = self.cwnd[0] / self.rtt.as_secs_f64();
-        self.send_pattern(self.rate, self.wait_time);
-
-        debug!(
-            ID = self.sock_id,
-            time_since_last_drop = (now - self.last_drop[0]).as_secs_f64(),
-            rtt = ?self.rtt,
-            "[nimbus cubic] got drop"
-        );
-        self.last_drop[0] = now;
-        self.agg_last_drop = now;
-    }
-
-    fn update_rate_loss(&mut self, new_bytes_acked: u64) {
-        self.update_rate_cubic(new_bytes_acked)
-    }
-
-    fn update_rate_cubic(&mut self, new_bytes_acked: u64) {
-        let mut no_of_acks = (new_bytes_acked as f64) / self.mss as f64;
-        if self.cubic_cwnd < self.cubic_ssthresh {
-            if (self.cubic_cwnd + no_of_acks) < self.cubic_ssthresh {
-                self.cubic_cwnd += no_of_acks;
-                no_of_acks = 0.0;
-            } else {
-                no_of_acks -= self.cubic_ssthresh - self.cubic_cwnd;
-                self.cubic_cwnd = self.cubic_ssthresh;
-            }
-        }
-        let rtt_seconds = self.rtt.as_secs_f64();
-        for _ in 0..no_of_acks as usize {
-            if self.d_min <= 0.0 || rtt_seconds < self.d_min {
-                self.d_min = rtt_seconds;
-            }
-            self.cubic_update();
-            if self.cwnd_cnt > self.cnt {
-                self.cubic_cwnd += 1.0;
-                self.cwnd_cnt = 0.0;
-            } else {
-                self.cwnd_cnt += 1.0;
-            }
-        }
-        self.cwnd[0] = self.cubic_cwnd * 1448.0;
-        let total_cwnd = self.cwnd[0];
-        self.rate = total_cwnd / rtt_seconds;
-        self.ewma_rate = self.rate;
-    }
-
-    fn cubic_update(&mut self) {
-        let now = Instant::now();
-        self.ack_cnt += 1.0;
-        if self.epoch_start.is_none() {
-            self.epoch_start = Some(now);
-            if self.cubic_cwnd < self.wlast_max {
-                self.k = (0.0f64.max((self.wlast_max - self.cubic_cwnd) / self.c)).powf(1.0 / 3.0);
-                self.origin_point = self.wlast_max;
-            } else {
-                self.k = 0.0;
-                self.origin_point = self.cubic_cwnd;
-            }
-            self.ack_cnt = 1.0;
-            self.wtcp = self.cubic_cwnd;
-        }
-        let t =
-            (now + Duration::from_secs_f64(self.d_min) - self.epoch_start.unwrap()).as_secs_f64();
-        let target = self.origin_point + self.c * ((t - self.k) * (t - self.k) * (t - self.k));
-        if target > self.cubic_cwnd {
-            self.cnt = self.cubic_cwnd / (target - self.cubic_cwnd);
-        } else {
-            self.cnt = 100.0 * self.cubic_cwnd;
-        }
-        if self.tcp_friendliness {
-            self.cubic_tcp_friendliness();
-        }
-    }
-
-    fn cubic_tcp_friendliness(&mut self) {
-        self.wtcp +=
-            ((3.0 * self.cubic_beta) / (2.0 - self.cubic_beta)) * (self.ack_cnt / self.cubic_cwnd);
-        self.ack_cnt = 0.0;
-        if self.wtcp > self.cubic_cwnd {
-            let max_cnt = self.cubic_cwnd / (self.wtcp - self.cubic_cwnd);
-            if self.cnt > max_cnt {
-                self.cnt = max_cnt;
-            }
-        }
-    }
-
     fn elasticity_est_pulse(&mut self) -> f64 {
         let elapsed = (Instant::now() - self.start_time.unwrap()).as_secs_f64();
         let fr_modified = self.uest;
@@ -551,7 +400,7 @@ impl<T: Ipc> NimbusFlow<T> {
         let t = self.measurement_interval.as_secs_f64();
 
         // get next higher power of 2
-        let n = (duration_of_fft / t) as i32;
+        let n = (duration_of_fft / t) as i32; // 5s / 10ms = 500
         let n = if n.count_ones() != 1 {
             1 << (32 - n.leading_zeros())
         } else {
@@ -560,13 +409,18 @@ impl<T: Ipc> NimbusFlow<T> {
 
         duration_of_fft = (n as f64) * t;
 
-        if self.start_time.is_none() || self.start_time.unwrap().elapsed() < Duration::from_secs(10)
+        if self.start_time.is_none()
+            || self.start_time.unwrap().elapsed() < Duration::from_secs(6)
+            || self.zt_history.len() < n as usize
         {
             return;
         }
 
         let end_index = self.zt_history.len() - 1;
-        let start_index = self.zt_history.len() - ((duration_of_fft + 1.0) / t) as usize;
+        let start_index = self
+            .zt_history
+            .len()
+            .saturating_sub(((duration_of_fft + 1.0) / t) as usize);
 
         let raw_zt = &self.zt_history.clone()[start_index..end_index]; // careful: complexity
         let raw_rtt = &self.rtt_history.clone()[start_index..end_index];
@@ -737,9 +591,5 @@ impl<T: Ipc> NimbusFlow<T> {
         a.iter()
             .map(|x| Complex::new(x.re - mean_val, 0.0))
             .collect()
-    }
-
-    fn handle_timeout(&mut self) {
-        self.handle_drop();
     }
 }
