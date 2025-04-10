@@ -47,6 +47,9 @@ pub struct NimbusConfig {
 
     #[structopt(long = "log_file")]
     pub log_file: Option<PathBuf>,
+
+    #[structopt(long = "spectrogram_log")]
+    pub spectrogram_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,9 +164,15 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
 
             cubic: Cubic::new(info.mss),
 
-            writer: self
+            log_writer: self
                 .cfg
                 .log_file
+                .as_ref()
+                .map(|f| Writer::from_path(f).unwrap()),
+
+            spectrogram_writer: self
+                .cfg
+                .spectrogram_log
                 .as_ref()
                 .map(|f| Writer::from_path(f).unwrap()),
         };
@@ -186,6 +195,15 @@ struct NimbusRecord {
     zt_bps: f64,
     rtt_us: u64,
     elasticity: f64,
+}
+
+#[derive(serde::Serialize)]
+struct SpectrogramRecord {
+    id: u32,
+    t_unix_ms: u128,
+    since_start_ms: u64,
+    frequency: f64,
+    power: f64,
 }
 
 pub struct NimbusFlow<T: Ipc> {
@@ -226,7 +244,8 @@ pub struct NimbusFlow<T: Ipc> {
     //set_win_cap: bool,
     cubic: cubic::Cubic,
 
-    writer: Option<Writer<File>>,
+    log_writer: Option<Writer<File>>,
+    spectrogram_writer: Option<Writer<File>>,
 }
 
 impl<T: Ipc> Flow for NimbusFlow<T> {
@@ -534,22 +553,60 @@ impl<T: Ipc> NimbusFlow<T> {
             Expected_Peak = expected_peak,
             "elasticity_inf"
         );
-        if let Some(w) = &mut self.writer {
+
+        let times = if self.log_writer.is_some() || self.spectrogram_writer.is_some() {
+            let t_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("unix time")
+                .as_millis();
+            let since_start_ms = self.start_time.unwrap().elapsed().as_millis() as u64;
+            Some((t_unix_ms, since_start_ms))
+        } else {
+            None
+        };
+
+        if let Some(w) = &mut self.log_writer {
+            let (t_unix_ms, since_start_ms) = times.unwrap();
             let r = NimbusRecord {
                 id: self.sock_id,
-                t_unix_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("unix time")
-                    .as_millis(),
-                since_start_ms: self.start_time.unwrap().elapsed().as_millis() as u64,
+                t_unix_ms,
+                since_start_ms,
                 rin_bps: self.ewma_rin * 8.0,
                 rout_bps: self.ewma_rout * 8.0,
                 zt_bps: avg_zt * 8.0,
                 rtt_us: self.rtt.as_micros() as u64,
                 elasticity: elasticity2,
             };
-            w.serialize(r).unwrap();
-            w.flush().unwrap();
+
+            let ok = w.serialize(r).map_err(anyhow::Error::new);
+            if let Err(err) = ok.and_then(|_| w.flush().map_err(anyhow::Error::new)) {
+                tracing::warn!(?err, "Could not write to csv file");
+            }
+        }
+
+        if let Some(w) = &mut self.spectrogram_writer {
+            let (t_unix_ms, since_start_ms) = times.unwrap();
+            let mut ok = Ok(());
+            for (power, f) in fft_zt
+                .iter()
+                .zip(freq.iter())
+                // cut off freqs above 15Hz
+                .take_while(|(_, f)| **f < 15.)
+            {
+                let s = SpectrogramRecord {
+                    id: self.sock_id,
+                    t_unix_ms,
+                    since_start_ms,
+                    frequency: *f,
+                    power: power.norm(),
+                };
+
+                ok = ok.and_then(|_| w.serialize(s).map_err(anyhow::Error::new));
+            }
+
+            if let Err(err) = ok.and_then(|_| w.flush().map_err(anyhow::Error::new)) {
+                tracing::warn!(?err, "Could not write to csv file");
+            }
         }
     }
 
