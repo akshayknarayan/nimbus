@@ -11,10 +11,13 @@ use tracing::{debug, info};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod cubic;
 
+static MEASUREMENT_INTERVAL: Duration = Duration::from_millis(10);
+static FFT_APPROX_DURATION: Duration = Duration::from_secs(5);
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "nimbus")]
 pub struct NimbusConfig {
@@ -57,9 +60,65 @@ pub struct Nimbus {
     cfg: NimbusConfig,
 }
 
+pub struct NimbusFlow<T: Ipc> {
+    control_channel: Datapath<T>,
+    sc: Scope,
+    sock_id: u32,
+    mss: u32,
+
+    rtt: Duration,
+    ewma_rtt: Option<f64>,
+    last_update: Instant,
+    base_rtt: f64,
+    wait_time: Duration,
+    start_time: Option<Instant>,
+
+    uest: f64,
+    rate: f64,
+
+    fft: Arc<dyn rustfft::Fft<f64>>,
+    fft_length: usize,
+    frequency: f64,
+    pulse_size: f64,
+    zt_history: Vec<f64>,
+    zt_lookback: usize,
+    rtt_history: Vec<f64>,
+    last_hist_update: Instant,
+
+    rin_history: Vec<f64>,
+    rout_history: Vec<f64>,
+    bw_est_mode: bool,
+    max_rout: f64,
+    ewma_rin: f64,
+    ewma_rout: f64,
+    ewma_zt: f64,
+    use_ewma: bool,
+    //set_win_cap: bool,
+    cubic: cubic::Cubic,
+
+    log_writer: Option<Writer<File>>,
+    spectrogram_writer: Option<Writer<File>>,
+}
+
 impl From<NimbusConfig> for Nimbus {
     fn from(cfg: NimbusConfig) -> Self {
         Self { cfg }
+    }
+}
+
+impl Nimbus {
+    fn get_fft_length(&self) -> (usize, f64) {
+        let t = MEASUREMENT_INTERVAL.as_secs_f64();
+        // get next higher power of 2
+        let n = (FFT_APPROX_DURATION.as_secs_f64() / t) as usize; // 5s / 10ms = 500
+        let n = if n.count_ones() != 1 {
+            1 << (32 - n.leading_zeros())
+        } else {
+            n
+        };
+
+        let duration_of_fft = (n as f64) * t;
+        return (n, duration_of_fft);
     }
 }
 
@@ -112,6 +171,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
     fn new_flow(&self, control: Datapath<T>, info: DatapathInfo) -> Self::Flow {
         info!(
             ipc = ?self.cfg.ipc,
+            sock_od = ?info.sock_id,
             bw_est_mode = ?self.cfg.bw_est_mode ,
             use_ewma = ?self.cfg.use_ewma ,
             set_win_cap = ?self.cfg.set_win_cap ,
@@ -123,8 +183,11 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
             "[nimbus] starting",
         );
 
-        let now = Instant::now();
+        let (fft_length, fft_duration_secs) = self.get_fft_length();
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_length);
 
+        let now = Instant::now();
         let mut s = NimbusFlow {
             sock_id: info.sock_id,
             control_channel: control,
@@ -145,20 +208,19 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
 
             rate: 100000f64,
 
-            fft_planner: FftPlanner::new(),
-            zout_history: vec![],
+            fft,
+            fft_length,
             zt_history: vec![],
+            zt_lookback: ((fft_duration_secs + 1.0) / MEASUREMENT_INTERVAL.as_secs_f64()) as usize,
             rtt_history: vec![],
-            measurement_interval: Duration::from_millis(10),
             last_hist_update: now,
-            ewma_elasticity: 1.0f64,
-            ewma_alpha: 0.01f64,
 
             rin_history: vec![],
             rout_history: vec![],
             max_rout: 0.0f64,
             ewma_rin: 0.0f64,
             ewma_rout: 0.0f64,
+            ewma_zt: 0.0f64,
 
             wait_time: Duration::from_millis(5),
 
@@ -195,7 +257,8 @@ struct NimbusRecord {
     rout_bps: f64,
     zt_bps: f64,
     rtt_us: u64,
-    elasticity: f64,
+    elasticity_max: f64,
+    elasticity_sum: f64,
 }
 
 #[derive(serde::Serialize)]
@@ -205,48 +268,6 @@ struct SpectrogramRecord {
     since_start_ms: u64,
     frequency: f64,
     power: f64,
-}
-
-pub struct NimbusFlow<T: Ipc> {
-    control_channel: Datapath<T>,
-    sc: Scope,
-    sock_id: u32,
-    mss: u32,
-
-    rtt: Duration,
-    ewma_rtt: Option<f64>,
-    last_update: Instant,
-    base_rtt: f64,
-    wait_time: Duration,
-    start_time: Option<Instant>,
-
-    uest: f64,
-    rate: f64,
-
-    fft_planner: rustfft::FftPlanner<f64>,
-    frequency: f64,
-    pulse_size: f64,
-    zout_history: Vec<f64>,
-    zt_history: Vec<f64>,
-    rtt_history: Vec<f64>,
-    measurement_interval: Duration,
-    last_hist_update: Instant,
-    //switching_thresh: f64,
-    ewma_elasticity: f64,
-    ewma_alpha: f64,
-
-    rin_history: Vec<f64>,
-    rout_history: Vec<f64>,
-    bw_est_mode: bool,
-    max_rout: f64,
-    ewma_rin: f64,
-    ewma_rout: f64,
-    use_ewma: bool,
-    //set_win_cap: bool,
-    cubic: cubic::Cubic,
-
-    log_writer: Option<Writer<File>>,
-    spectrogram_writer: Option<Writer<File>>,
 }
 
 impl<T: Ipc> Flow for NimbusFlow<T> {
@@ -310,19 +331,21 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
         if zt.is_nan() {
             zt = 0.0;
         }
+        self.ewma_zt = 0.2 * zt + 0.8 * self.ewma_zt;
 
         while now > self.last_hist_update {
             self.rin_history.push(rin);
             self.rout_history.push(rout);
-            self.zout_history.push(self.uest - rout);
             self.zt_history.push(zt);
             self.rtt_history.push(self.rtt.as_secs_f64());
-            self.last_hist_update += self.measurement_interval;
+            // some zt measurements might be missing.
+            // so, we back-fill values given the sample we do have, as if we had gotten those
+            // values regularly every `MEASUREMENT_INTERVAL`.
+            self.last_hist_update += MEASUREMENT_INTERVAL;
         }
 
         // Overlay Nimbus pulse
         // check this
-        self.frequency = 5.0f64;
         self.rate = self.rate.max(0.05 * self.uest);
         self.rate = self.elasticity_est_pulse().max(0.05 * self.uest);
 
@@ -421,137 +444,60 @@ impl<T: Ipc> NimbusFlow<T> {
     }
 
     fn measure_elasticity(&mut self) {
-        let mut duration_of_fft = 5.0;
-        let t = self.measurement_interval.as_secs_f64();
-
-        // get next higher power of 2
-        let n = (duration_of_fft / t) as i32; // 5s / 10ms = 500
-        let n = if n.count_ones() != 1 {
-            1 << (32 - n.leading_zeros())
-        } else {
-            n
-        };
-
-        duration_of_fft = (n as f64) * t;
-
         if self.start_time.is_none()
             || self.start_time.unwrap().elapsed() < Duration::from_secs(6)
-            || self.zt_history.len() < n as usize
+            || self.zt_history.len() < self.zt_lookback as usize
         {
             return;
         }
 
         let end_index = self.zt_history.len() - 1;
-        let start_index = self
-            .zt_history
-            .len()
-            .saturating_sub(((duration_of_fft + 1.0) / t) as usize);
+        let start_index = self.zt_history.len().saturating_sub(self.zt_lookback);
 
         let raw_zt = &self.zt_history.clone()[start_index..end_index]; // careful: complexity
         let raw_rtt = &self.rtt_history.clone()[start_index..end_index];
-        let raw_zout = &self.zout_history.clone()[start_index..end_index];
 
         let mut clean_zt: Vec<Complex<f64>> = Vec::new(); // careful: complexity
-        let mut clean_zout: Vec<Complex<f64>> = Vec::new();
-        let mut clean_rtt: Vec<Complex<f64>> = Vec::new();
 
-        for i in 0..n {
+        // if we got all measurements, the length will be n
+        //   (which is round_to_next_power_of_2(duration_of_fft[5s] / measurement_interval[10ms])
+        //   (so, usually 512)
+        //
+        // t is the measurement interval - how far apart in time the zt entries are. raw_rtt / t is thus the number of measurements in that
+        // rtt. the rtt might vary over time,
+        for i in 0..self.fft_length {
             if i as usize >= raw_rtt.len() {
                 return;
             }
 
-            let j = i as usize + 2 * ((raw_rtt[i as usize] / t) as usize);
+            let j = i as usize
+                + 2 * ((raw_rtt[i as usize] / MEASUREMENT_INTERVAL.as_secs_f64()) as usize);
             if j >= raw_zt.len() {
                 return;
             }
 
             clean_zt.push(Complex::new(raw_zt[j], 0.0));
-            clean_zout.push(Complex::new(raw_zout[i as usize], 0.0));
-            clean_rtt.push(Complex::new(raw_rtt[i as usize], 0.0));
         }
-
-        //let avg_rtt = Duration::from_millis(
-        //    (1e3 * self.mean_complex(&clean_rtt[(0.75 * (clean_rtt.len() as f32)) as usize..]))
-        //        as u64,
-        //);
-        let avg_zt = self.mean_complex(&clean_zt[(0.75 * (clean_zt.len() as f32)) as usize..]);
 
         let mut fft_zt = self.detrend(clean_zt);
-        let fft_zt_temp = self.fft_planner.plan_fft_forward(fft_zt.len());
-        fft_zt_temp.process(&mut fft_zt[..]);
-
-        let mut fft_zout = self.detrend(clean_zout);
-        let fft_zout_temp = self.fft_planner.plan_fft_forward(fft_zout.len());
-        fft_zout_temp.process(&mut fft_zout[..]);
+        self.fft.process(&mut fft_zt[..]);
 
         let mut freq: Vec<f64> = Vec::new();
-        for i in 0..((n / 2) as usize) {
-            freq.push(i as f64 * (1.0 / (n as f64 * t)));
+        for i in 0..((self.fft_length / 2) as usize) {
+            freq.push(
+                i as f64 * (1.0 / (self.fft_length as f64 * MEASUREMENT_INTERVAL.as_secs_f64())),
+            );
         }
 
-        let expected_peak = self.frequency;
-
-        if avg_zt < 0.1 * self.uest {
-            self.ewma_elasticity = 0.0;
-        } else if avg_zt > 0.9 * self.uest {
-            self.ewma_elasticity =
-                (1.0 - self.ewma_alpha) * self.ewma_elasticity + self.ewma_alpha * 6.0;
-        }
-
-        let (_, mean_zt) = self.find_peak(
-            2.2 * expected_peak,
-            3.8 * expected_peak,
-            &freq[..],
-            &fft_zt[..],
-        );
-        let (exp_peak_zt, _) = self.find_peak(
-            expected_peak - 0.5,
-            expected_peak + 0.5,
-            &freq[..],
-            &fft_zt[..],
-        );
-        let (exp_peak_zout, _) = self.find_peak(
-            expected_peak - 0.5,
-            expected_peak + 0.5,
-            &freq[..],
-            &fft_zout[..],
-        );
-        let (other_peak_zt, _) = self.find_peak(
-            expected_peak + 1.5,
-            2.0 * expected_peak - 0.5,
-            &freq[..],
-            &fft_zt[..],
-        );
-        let (other_peak_zout, _) = self.find_peak(
-            expected_peak + 1.5,
-            2.0 * expected_peak - 0.5,
-            &freq[..],
-            &fft_zout[..],
-        );
-        let mut elasticity2 = fft_zt[exp_peak_zt].norm() / fft_zt[other_peak_zt].norm();
-        let elasticity = (fft_zt[exp_peak_zt].norm() - mean_zt) / fft_zout[exp_peak_zout].norm();
-        if fft_zt[exp_peak_zt].norm() < 0.25 * fft_zout[exp_peak_zout].norm() {
-            elasticity2 = elasticity2.min(3.0);
-            elasticity2 *=
-                ((fft_zt[exp_peak_zt].norm() / fft_zout[exp_peak_zout].norm()) / 0.25).min(1.0);
-        }
-        self.ewma_elasticity =
-            (1.0 - self.ewma_alpha) * self.ewma_elasticity + self.ewma_alpha * elasticity2;
-
-        if (fft_zout[exp_peak_zout].norm() / fft_zout[other_peak_zout].norm()) < 2.0 {
-            self.ewma_elasticity =
-                (1.0 - self.ewma_alpha) * self.ewma_elasticity + self.ewma_alpha * 3.0;
-        }
+        let elasticity = self.compute_elasticity(&freq, &fft_zt);
+        let elasticity_sum = self.compute_elasticity_sum(&freq, &fft_zt);
 
         debug!(
             ID = self.sock_id,
-            Zout_peak_val = fft_zout[exp_peak_zout].norm(),
-            Zt_peak_val = fft_zt[exp_peak_zt].norm(),
             elapsed = ?self.start_time.unwrap().elapsed(),
             Elasticity = elasticity,
-            Elasticity2 = elasticity2,
-            EWMAElasticity = self.ewma_elasticity,
-            Expected_Peak = expected_peak,
+            SumBasedElasticity = elasticity_sum,
+            Expected_Peak = self.frequency,
             "elasticity_inf"
         );
 
@@ -575,9 +521,10 @@ impl<T: Ipc> NimbusFlow<T> {
                 uest_bps: self.uest * 8.0,
                 rin_bps: self.ewma_rin * 8.0,
                 rout_bps: self.ewma_rout * 8.0,
-                zt_bps: avg_zt * 8.0,
+                zt_bps: self.ewma_zt * 8.0,
                 rtt_us: self.rtt.as_micros() as u64,
-                elasticity: elasticity2,
+                elasticity_max: elasticity,
+                elasticity_sum,
             };
 
             let ok = w.serialize(r).map_err(anyhow::Error::new);
@@ -592,8 +539,8 @@ impl<T: Ipc> NimbusFlow<T> {
             for (power, f) in fft_zt
                 .iter()
                 .zip(freq.iter())
-                // cut off freqs above 15Hz
-                .take_while(|(_, f)| **f < 15.)
+                // cut off freqs above 10Hz
+                .take_while(|(_, f)| **f < 10.)
             {
                 let s = SpectrogramRecord {
                     id: self.sock_id,
@@ -610,6 +557,23 @@ impl<T: Ipc> NimbusFlow<T> {
                 tracing::warn!(?err, "Could not write to csv file");
             }
         }
+    }
+
+    fn compute_elasticity(&self, freq: &[f64], fft_zt: &[Complex<f64>]) -> f64 {
+        let (zt_pulse_freqs_max_idx, _) = self.find_peak(
+            self.frequency - 0.25,
+            self.frequency + 0.25,
+            &freq[..],
+            &fft_zt[..],
+        );
+        let (zt_neighbor_freqs_max_idx, _) = self.find_peak(
+            self.frequency + 0.5,
+            2.0 * self.frequency - 0.5,
+            &freq[..],
+            &fft_zt[..],
+        );
+
+        return fft_zt[zt_pulse_freqs_max_idx].norm() / fft_zt[zt_neighbor_freqs_max_idx].norm();
     }
 
     fn find_peak(
@@ -640,6 +604,33 @@ impl<T: Ipc> NimbusFlow<T> {
         }
 
         (max_ind, mean / count.max(1.0))
+    }
+
+    // `compute_elasticity()` finds the *max* value in the pulse region and divides it by the *max*
+    // value in the neighbor region.
+    //
+    // Instead, we're going to divide the *totals*.
+    fn compute_elasticity_sum(&self, freq: &[f64], fft_zt: &[Complex<f64>]) -> f64 {
+        // pulse region: f_p +/- \epsilon = 0.5
+        let pulse_region_start = self.frequency - 0.5;
+        let pulse_region_end = self.frequency + 0.5;
+        // neighbor region: frequencies from f_p + \epsilon to 2*f_p - \epsilon
+        let neighbor_region_start = self.frequency + 0.5;
+        let neighbor_region_end = (2. * self.frequency) + 0.5;
+        let (pulse_region_sum, neighbor_region_sum) = freq
+            .into_iter()
+            .zip(fft_zt.into_iter())
+            .skip_while(|(frq, _)| **frq < pulse_region_start)
+            .fold((0.0, 0.0), |(pulse_sum, neighbor_sum), (frq, pwr)| {
+                if *frq < pulse_region_end {
+                    (pulse_sum + (pwr.norm()), neighbor_sum)
+                } else if *frq > neighbor_region_start && *frq < neighbor_region_end {
+                    (pulse_sum, neighbor_sum + (pwr.norm()))
+                } else {
+                    (pulse_sum, neighbor_sum)
+                }
+            });
+        return pulse_region_sum / neighbor_region_sum;
     }
 
     fn mean_complex(&self, a: &[Complex<f64>]) -> f64 {
