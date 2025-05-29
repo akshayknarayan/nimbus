@@ -110,13 +110,12 @@ impl Nimbus {
     fn get_fft_length(&self) -> (usize, f64) {
         let t = MEASUREMENT_INTERVAL.as_secs_f64();
         // get next higher power of 2
-        let n = (FFT_APPROX_DURATION.as_secs_f64() / t) as usize; // 5s / 10ms = 500
+        let n = (FFT_APPROX_DURATION.as_secs_f64() / t) as u32; // 5s / 10ms = 500
         let n = if n.count_ones() != 1 {
-            1 << (32 - n.leading_zeros())
+            1 << ((std::mem::size_of_val(&n) as u32 * 8) - n.leading_zeros())
         } else {
             n
-        };
-
+        } as usize;
         let duration_of_fft = (n as f64) * t;
         return (n, duration_of_fft);
     }
@@ -186,6 +185,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
         let (fft_length, fft_duration_secs) = self.get_fft_length();
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(fft_length);
+        debug!(?fft_length, fft_duration_secs, "created fft instance");
 
         let now = Instant::now();
         let mut s = NimbusFlow {
@@ -454,8 +454,8 @@ impl<T: Ipc> NimbusFlow<T> {
         let end_index = self.zt_history.len() - 1;
         let start_index = self.zt_history.len().saturating_sub(self.zt_lookback);
 
-        let raw_zt = &self.zt_history.clone()[start_index..end_index]; // careful: complexity
-        let raw_rtt = &self.rtt_history.clone()[start_index..end_index];
+        let raw_zt = &self.zt_history[start_index..end_index]; // careful: complexity
+        let raw_rtt = &self.rtt_history[start_index..end_index];
 
         let mut clean_zt: Vec<Complex<f64>> = Vec::new(); // careful: complexity
 
@@ -463,8 +463,8 @@ impl<T: Ipc> NimbusFlow<T> {
         //   (which is round_to_next_power_of_2(duration_of_fft[5s] / measurement_interval[10ms])
         //   (so, usually 512)
         //
-        // t is the measurement interval - how far apart in time the zt entries are. raw_rtt / t is thus the number of measurements in that
-        // rtt. the rtt might vary over time,
+        // raw_rtt / measurement_interval is the number of measurements in that rtt. the rtt might
+        // vary over time, so this way we can get a consistent number of zt measurements per rtt.
         for i in 0..self.fft_length {
             if i as usize >= raw_rtt.len() {
                 return;
