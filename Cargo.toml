@@ -1,11 +1,11 @@
 [package]
 name = "ccp_nimbus"
-version = "0.4.1"
+version = "0.5.0"
 authors = ["Prateesh Goyal <prateesh@mit.edu>"]
 edition = "2021"
 
 [dependencies]
-portus = "0.8"
+portus = "0.9"
 rand="0.8"
 anyhow = "1"
 num-complex="0.4"
