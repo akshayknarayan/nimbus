@@ -1,10 +1,10 @@
 use ccp_nimbus::{Nimbus, NimbusConfig};
-use structopt::StructOpt;
+use clap::Parser;
 use tracing::info;
 
 fn main() {
     tracing_subscriber::fmt::init();
-    let cfg = NimbusConfig::from_args();
+    let cfg = NimbusConfig::parse();
     let ipc = cfg.ipc.clone();
     let nimbus: Nimbus = cfg.into();
 

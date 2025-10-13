@@ -2,7 +2,7 @@
 name = "ccp_nimbus"
 version = "0.5.0"
 authors = ["Prateesh Goyal <prateesh@mit.edu>"]
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 portus = "0.9"
@@ -12,6 +12,6 @@ num-complex="0.4"
 rustfft="6"
 tracing="0.1"
 tracing-subscriber="0.3"
-structopt = "0.2"
 csv="1.2.2"
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

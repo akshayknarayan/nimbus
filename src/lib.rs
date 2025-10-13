@@ -1,11 +1,10 @@
+use clap::Parser;
 use csv::Writer;
-use cubic::Cubic;
 use num_complex::Complex;
 use portus::ipc::Ipc;
 use portus::lang::Scope;
 use portus::{CongAlg, Datapath, DatapathInfo, DatapathTrait, Flow, Report};
 use rustfft::FftPlanner;
-use structopt::StructOpt;
 use tracing::{debug, info};
 
 use std::collections::HashMap;
@@ -14,50 +13,66 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod bbr;
 mod cubic;
 
 static MEASUREMENT_INTERVAL: Duration = Duration::from_millis(10);
 static FFT_APPROX_DURATION: Duration = Duration::from_secs(5);
-#[derive(StructOpt, Debug, Clone)]
-#[structopt(name = "nimbus")]
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum CCModeArg {
+    Cubic,
+    Bbr,
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "nimbus")]
 pub struct NimbusConfig {
-    #[structopt(long = "ipc", default_value = "unix")]
+    #[arg(long = "ipc", default_value = "unix")]
     pub ipc: String,
 
-    #[structopt(long = "bw_est_mode")]
+    #[arg(long = "bw_est_mode")]
     pub bw_est_mode: bool,
 
-    #[structopt(long = "use_ewma")]
+    #[arg(long = "use_ewma")]
     pub use_ewma: bool,
 
-    #[structopt(long = "set_win_cap")]
-    pub set_win_cap: bool,
-
-    #[structopt(long = "delay_threshold", default_value = "1.25")]
-    pub delay_threshold: f64,
-
-    #[structopt(long = "init_delay_threshold", default_value = "1.25")]
-    pub init_delay_threshold: f64,
-
-    #[structopt(long = "pulse_size", default_value = "0.25")]
+    #[arg(long = "pulse_size", default_value = "0.25")]
     pub pulse_size: f64,
 
-    #[structopt(long = "frequency", default_value = "5.0")]
+    #[arg(long = "frequency", default_value = "5.0")]
     pub frequency: f64,
 
-    #[structopt(long = "uest", default_value = "12000000.0")]
+    #[arg(long = "ccmode", value_enum, default_value = "cubic")]
+    pub cc_mode: CCModeArg,
+
+    #[arg(long = "uest", default_value = "12000000.0")]
     pub uest: f64,
 
-    #[structopt(long = "log_file")]
+    #[arg(long = "log_file")]
     pub log_file: Option<PathBuf>,
 
-    #[structopt(long = "spectrogram_log")]
+    #[arg(long = "spectrogram_log")]
     pub spectrogram_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Nimbus {
     cfg: NimbusConfig,
+}
+
+enum CCMode {
+    Cubic(cubic::Cubic),
+    Bbr(bbr::Bbr),
+}
+
+impl CCMode {
+    fn curr_cwnd_bytes(&self) -> f64 {
+        match self {
+            CCMode::Cubic(c) => c.curr_cwnd_bytes(),
+            CCMode::Bbr(b) => b.curr_cwnd_bytes(),
+        }
+    }
 }
 
 pub struct NimbusFlow<T: Ipc> {
@@ -93,8 +108,7 @@ pub struct NimbusFlow<T: Ipc> {
     ewma_rout: f64,
     ewma_zt: f64,
     use_ewma: bool,
-    //set_win_cap: bool,
-    cubic: cubic::Cubic,
+    cc_mode: CCMode,
 
     log_writer: Option<Writer<File>>,
     spectrogram_writer: Option<Writer<File>>,
@@ -170,15 +184,12 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
     fn new_flow(&self, control: Datapath<T>, info: DatapathInfo) -> Self::Flow {
         info!(
             ipc = ?self.cfg.ipc,
-            sock_od = ?info.sock_id,
-            bw_est_mode = ?self.cfg.bw_est_mode ,
-            use_ewma = ?self.cfg.use_ewma ,
-            set_win_cap = ?self.cfg.set_win_cap ,
-            delay_threshold = ?self.cfg.delay_threshold ,
-            init_delay_threshold = ?self.cfg.init_delay_threshold ,
-            pulse_size = ?self.cfg.pulse_size ,
-            frequency = ?self.cfg.frequency ,
-            uest = ?self.cfg.uest ,
+            sock_id = ?info.sock_id,
+            bw_est_mode = ?self.cfg.bw_est_mode,
+            use_ewma = ?self.cfg.use_ewma,
+            pulse_size = ?self.cfg.pulse_size,
+            frequency = ?self.cfg.frequency,
+            uest = ?self.cfg.uest,
             "[nimbus] starting",
         );
 
@@ -199,7 +210,6 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
             pulse_size: self.cfg.pulse_size,
             uest: self.cfg.uest,
             use_ewma: self.cfg.use_ewma,
-            //set_win_cap:  self.cfg.set_win_cap_arg,
             base_rtt: -0.001f64, // careful
             last_update: now,
             rtt: Duration::from_millis(300),
@@ -224,7 +234,10 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
 
             wait_time: Duration::from_millis(5),
 
-            cubic: Cubic::new(info.mss),
+            cc_mode: match self.cfg.cc_mode {
+                CCModeArg::Cubic => CCMode::Cubic(cubic::Cubic::new(info.mss)),
+                CCModeArg::Bbr => CCMode::Bbr(bbr::Bbr::new(info.mss)),
+            },
 
             log_writer: self
                 .cfg
@@ -239,7 +252,6 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
                 .map(|f| Writer::from_path(f).unwrap()),
         };
 
-        //s.cubic_reset(); Careful
         let wt = s.wait_time;
         s.sc = s.install(wt);
         s.send_pattern(s.rate, wt);
@@ -276,17 +288,22 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
         let (acked, rtt_us, mut rin, mut rout, loss, was_timeout) = self.get_fields(&m).unwrap();
         self.rtt = Duration::from_micros(rtt_us as _);
 
-        if loss > 0 {
-            self.cubic.drop(self.sock_id, self.rtt);
-            let cwnd = self.cubic.curr_cwnd_bytes();
-            self.rate = cwnd / self.rtt.as_secs_f64();
-            self.send_pattern(self.rate, self.wait_time);
-            return;
-        }
+        match self.cc_mode {
+            CCMode::Cubic(ref mut cubic) => {
+                if loss > 0 {
+                    cubic.drop(self.sock_id, self.rtt);
+                    let cwnd = cubic.curr_cwnd_bytes();
+                    self.rate = cwnd / self.rtt.as_secs_f64();
+                    self.send_pattern(self.rate, self.wait_time);
+                    return;
+                }
 
-        if was_timeout {
-            self.cubic.drop(self.sock_id, self.rtt); // Careful
-            return;
+                if was_timeout {
+                    cubic.drop(self.sock_id, self.rtt); // Careful
+                    return;
+                }
+            }
+            _ => (),
         }
 
         let rtt_seconds = self.rtt.as_secs_f64();
@@ -303,10 +320,18 @@ impl<T: Ipc> Flow for NimbusFlow<T> {
             self.start_time = Some(now);
         }
 
-        // Cubic update
-        self.cubic.update_rate(acked as u64, self.rtt);
-        // update self.rate based on cubic
-        self.rate = self.cubic.curr_cwnd_bytes() / rtt_seconds;
+        // CCA update
+        match self.cc_mode {
+            CCMode::Cubic(ref mut cubic) => {
+                cubic.update_rate(acked as u64, self.rtt);
+            }
+            CCMode::Bbr(ref mut bbr) => {
+                bbr.update(self.rtt, rout);
+            }
+        }
+
+        // update self.rate
+        self.rate = self.cc_mode.curr_cwnd_bytes() / rtt_seconds;
 
         let elapsed = (now - self.start_time.unwrap()).as_secs_f64();
         //let mut  float_rin = rin as f64;
