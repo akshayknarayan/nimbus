@@ -236,7 +236,7 @@ impl<T: Ipc> CongAlg<T> for Nimbus {
 
             cc_mode: match self.cfg.cc_mode {
                 CCModeArg::Cubic => CCMode::Cubic(cubic::Cubic::new(info.mss)),
-                CCModeArg::Bbr => CCMode::Bbr(bbr::Bbr::new(info.mss)),
+                CCModeArg::Bbr => CCMode::Bbr(bbr::Bbr::new(info.mss, self.cfg.frequency)),
             },
 
             log_writer: self
